@@ -1,0 +1,5 @@
+node_modules/
+transcript-*.jsonl
+final-*.json
+.env
+.DS_Store
