@@ -1,16 +1,14 @@
 import puppeteer from 'puppeteer';
-import Anthropic from '@anthropic-ai/sdk';
+import { query } from '@anthropic-ai/claude-agent-sdk';
 import fs from 'fs';
 
 const TRANSCRIPT_FILE = `transcript-${Date.now()}.jsonl`;
 const NUDGE_INTERVAL_MS = 2 * 60 * 1000;
-const MODEL_ID = 'claude-opus-4-7';
+const MODEL_ID = 'opus';
 
 const seen = new Set();
 const transcript = [];
 let lastNudgeIndex = 0;
-
-const claude = new Anthropic();
 
 const SYSTEM_PROMPT = `You are an observer for a creative-team workflow tutoring session.
 
@@ -143,14 +141,26 @@ async function nudgeTurn() {
     .join('\n');
 
   try {
-    const resp = await claude.messages.create({
-      model: MODEL_ID,
-      max_tokens: 200,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: transcriptText }],
+    const result = query({
+      prompt: transcriptText,
+      options: {
+        systemPrompt: SYSTEM_PROMPT,
+        model: MODEL_ID,
+        maxTurns: 1,
+        tools: [],
+        effort: 'low',
+      },
     });
-    const raw = resp.content[0].text.trim();
-    const parsed = JSON.parse(raw);
+
+    let raw = '';
+    for await (const msg of result) {
+      if (msg.type !== 'assistant') continue;
+      for (const block of msg.message.content) {
+        if (block.type === 'text') raw += block.text;
+      }
+    }
+
+    const parsed = JSON.parse(stripFences(raw).trim());
     if (parsed.urgency !== 'none' && parsed.text) {
       console.log(`💡 [${parsed.urgency}] ${parsed.text}`);
       await injectOverlay();
@@ -159,4 +169,8 @@ async function nudgeTurn() {
   } catch (err) {
     console.error('nudge error:', err.message);
   }
+}
+
+function stripFences(s) {
+  return s.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
 }

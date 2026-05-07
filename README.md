@@ -10,12 +10,20 @@ automating.
 
 ## Setup
 
-Requires Node 20+ and an Anthropic API key.
+Requires Node 20+ and a logged-in Claude Code CLI (`claude`).
 
 ```sh
 npm install
-export ANTHROPIC_API_KEY=sk-ant-...
+# confirm `claude` is on PATH and authenticated
+claude --version
 ```
+
+This branch uses `@anthropic-ai/claude-agent-sdk`, which shells out to your
+local `claude` CLI for inference. Auth comes from your Claude
+Pro/Max subscription — no `ANTHROPIC_API_KEY` needed.
+
+If you'd rather pay per-token via the Anthropic API, switch to the
+`feat/observer` branch which uses `@anthropic-ai/sdk` directly.
 
 ## Run
 
@@ -84,7 +92,7 @@ In `observer.js` near the top:
 | Const | Default | What it does |
 |-------|---------|---|
 | `NUDGE_INTERVAL_MS` | `2 * 60 * 1000` | How often Claude is asked for a nudge. |
-| `MODEL_ID` | `claude-opus-4-7` | Claude model id. Check `https://docs.claude.com` if it 404s. |
+| `MODEL_ID` | `opus` | Claude Agent SDK model alias (`opus`, `sonnet`, `haiku`) or full id like `claude-opus-4-7`. |
 
 ## Google login fallback
 
