@@ -42,6 +42,12 @@ process.stdin.once('data', () => startScraping());
 
 async function startScraping() {
   console.log(`🔵 Scraping captions every 3s. Writing to ${TRANSCRIPT_FILE}.`);
+  console.log('   Type "session over" + Enter to flush final notes and exit.');
+
+  process.stdin.on('data', (data) => {
+    const cmd = data.toString().trim().toLowerCase();
+    if (cmd === 'session over') endSession();
+  });
 
   setInterval(async () => {
     try {
@@ -109,6 +115,22 @@ async function showNudge({ urgency, text }) {
   } catch (err) {
     console.error('overlay update error:', err.message);
   }
+}
+
+function endSession() {
+  const finalFile = `final-${Date.now()}.json`;
+  console.log(`🟡 Session ended. Writing ${transcript.length} entries to ${finalFile}.`);
+  try {
+    fs.writeFileSync(finalFile, JSON.stringify({
+      transcript_file: TRANSCRIPT_FILE,
+      ended_at: Date.now(),
+      entry_count: transcript.length,
+      transcript,
+    }, null, 2));
+  } catch (err) {
+    console.error('final dump error:', err.message);
+  }
+  process.exit(0);
 }
 
 async function nudgeTurn() {
