@@ -1,0 +1,17 @@
+{
+  "name": "claude-google-meet-chat-helper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "observer.js",
+  "scripts": {
+    "start": "node observer.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.132",
+    "puppeteer": "^24.43.0"
+  }
+}
