@@ -21,6 +21,7 @@ let autoNudgeOn = true;
 let nudgeTimer = null;
 let busy = false;
 let welcomeShown = false;
+let chatSessionId = null;
 
 const NUDGE_PROMPT = `You are an observer for a creative-team workflow tutoring session.
 
@@ -52,6 +53,7 @@ Things you already know about your environment, so you do not need to ask:
   If query_gemini returns "drawer is not open", tell the user once to open the sparkles icon in Meet and then answer from what you have.
 - The user can also run /gemini <q> directly to bypass you and ask Gemini themselves; that posts as a purple bubble.
 - The recent caption transcript is included in your prompt as context. The user does not need you to repeat it back.
+- This conversation is continuous. You can see your prior messages, prior tool calls (including past query_gemini results), and what the user has already asked. Don't pretend each turn is fresh — when the user references something from earlier in this chat, you have it. The user can run /clear if they want to wipe your memory and start over.
 
 Voice rules — non-negotiable:
 - 1-3 sentences. They are reading you for half a second between thoughts.
@@ -90,10 +92,13 @@ const HELP_TEXT = `Commands:
   /auto on|off  toggle auto-nudge
   /gemini      report Gemini-in-Meet drawer status
   /gemini <q>  ask Gemini-in-Meet (drawer must be open)
+  /clear       reset chat memory (start a fresh conversation)
   /help        this list
   /quit or "session over"   end and dump final-*.json
 
-Free text → chat with Claude (with recent transcript context).
+Free text → chat with Claude. Conversation persists across turns
+(Claude remembers prior messages, prior Gemini calls, etc.) until
+you /clear or end the session.
 
 Hotkeys (when the overlay is focused and input is empty):
   n=nudge  o=notes  t=type  ?=help  Esc=blur`;
@@ -280,6 +285,10 @@ async function dispatchCommand(cmd, arg) {
       return appendMessage({ role: 'system', text: 'Usage: /auto on|off' });
     }
 
+    case 'clear':
+      chatSessionId = null;
+      return appendMessage({ role: 'system', text: 'Chat memory cleared. Next message starts a fresh conversation. Transcript and notes are untouched.' });
+
     case 'quit':
       return endSession();
 
@@ -300,41 +309,55 @@ async function askClaude(userText) {
   await setStatus('thinking…');
   try {
     const recent = transcript.slice(-30).map(e => `${e.speaker}: ${e.text}`).join('\n');
-    const prompt = `Recent transcript window:\n---\n${recent || '(no captions yet)'}\n---\n\nFacilitator: ${userText}`;
+    const prompt = `Latest transcript window (this is the current snapshot — earlier turns may overlap):\n---\n${recent || '(no captions yet)'}\n---\n\nFacilitator: ${userText}`;
 
-    const result = query({
-      prompt,
-      options: {
-        systemPrompt: CHAT_PROMPT,
-        model: MODEL_ID,
-        maxTurns: 4,
-        tools: [],
-        mcpServers: { observer: observerMcp },
-        allowedTools: ['mcp__observer__query_gemini'],
-        effort: 'low',
-      },
-    });
-
-    let raw = '';
-    for await (const msg of result) {
-      if (msg.type !== 'assistant') continue;
-      for (const block of msg.message.content) {
-        if (block.type === 'text') {
-          raw += block.text;
-        } else if (block.type === 'tool_use' && block.name?.includes('query_gemini')) {
-          const q = block.input?.question || '(no question captured)';
-          await appendMessage({ role: 'system', text: `claude → gemini: ${q}` });
-          await setStatus('claude is asking gemini…');
-        }
-      }
-    }
-    await appendMessage({ role: 'assistant', text: raw.trim() || '(empty response)' });
+    const result = await runChatTurn(prompt);
+    await appendMessage({ role: 'assistant', text: (result || '').trim() || '(empty response)' });
   } catch (err) {
-    await appendMessage({ role: 'error', text: `chat error: ${err.message}` });
+    if (chatSessionId && /resume|session/i.test(err.message)) {
+      // Likely a stale session — drop it and let the user retry fresh.
+      chatSessionId = null;
+      await appendMessage({ role: 'error', text: `chat error (cleared session, try again): ${err.message}` });
+    } else {
+      await appendMessage({ role: 'error', text: `chat error: ${err.message}` });
+    }
   } finally {
     busy = false;
     await setStatus('idle');
   }
+}
+
+async function runChatTurn(prompt) {
+  const options = {
+    systemPrompt: CHAT_PROMPT,
+    model: MODEL_ID,
+    maxTurns: 4,
+    tools: [],
+    mcpServers: { observer: observerMcp },
+    allowedTools: ['mcp__observer__query_gemini'],
+    effort: 'low',
+  };
+  if (chatSessionId) options.resume = chatSessionId;
+
+  const result = query({ prompt, options });
+
+  let raw = '';
+  let lastSessionId = null;
+  for await (const msg of result) {
+    if (msg.session_id) lastSessionId = msg.session_id;
+    if (msg.type !== 'assistant') continue;
+    for (const block of msg.message.content) {
+      if (block.type === 'text') {
+        raw += block.text;
+      } else if (block.type === 'tool_use' && block.name?.includes('query_gemini')) {
+        const q = block.input?.question || '(no question captured)';
+        await appendMessage({ role: 'system', text: `claude → gemini: ${q}` });
+        await setStatus('claude is asking gemini…');
+      }
+    }
+  }
+  if (lastSessionId) chatSessionId = lastSessionId;
+  return raw;
 }
 
 async function runNudge({ silent = false, source = 'manual' } = {}) {

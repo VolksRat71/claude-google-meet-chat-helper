@@ -61,6 +61,7 @@ ways to use it:
 /auto on|off  toggle auto-nudge
 /gemini       report Gemini-in-Meet drawer status
 /gemini <q>   ask Gemini-in-Meet (drawer must be open)
+/clear        reset chat memory (fresh conversation)
 /help         this list
 /quit         end and dump final-*.json
 ```
