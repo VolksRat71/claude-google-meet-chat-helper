@@ -1,5 +1,6 @@
 import puppeteer from 'puppeteer';
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 import fs from 'fs';
 
 const TRANSCRIPT_FILE = `transcript-${Date.now()}.jsonl`;
@@ -43,7 +44,13 @@ const CHAT_PROMPT = `You are Claude, embedded in a small chat panel that runs in
 Things you already know about your environment, so you do not need to ask:
 - A peer instance of yourself runs on a cron (default 3 minutes) and posts short "nudges" into this same panel. Those appear as orange (urgency: now) or gray (urgency: later) bubbles. You do NOT generate those — a separate prompt does.
 - A /notes command writes notes-<ts>.md, a markdown synthesis of the workflow so far. That is also a separate peer instance of you with its own prompt.
-- A /gemini command exists for asking Gemini-in-Meet via the side panel, but the Puppeteer wiring is not done yet. If the user asks you to "consult Gemini" or "ask Gemini" right now, just give your own best answer grounded in the transcript and briefly mention the integration is coming. Do NOT say "no Gemini tool available" — that's wrong framing; just answer.
+- You have a tool called query_gemini. Gemini-in-Meet has the FULL meeting context — its own transcript, participants, chat, metadata — which is richer than the partial caption window you have. Use query_gemini when:
+  - The captions don't include the context you'd need to answer well.
+  - You'd otherwise be guessing.
+  - The user explicitly asks you to consult Gemini.
+  Do NOT use it for every message. Each call takes 5-15 seconds and is visible to the user. Default to answering from the transcript and your own knowledge when you reasonably can. Frame your Gemini questions specifically — Gemini has the full meeting, leverage that.
+  If query_gemini returns "drawer is not open", tell the user once to open the sparkles icon in Meet and then answer from what you have.
+- The user can also run /gemini <q> directly to bypass you and ask Gemini themselves; that posts as a purple bubble.
 - The recent caption transcript is included in your prompt as context. The user does not need you to repeat it back.
 
 Voice rules — non-negotiable:
@@ -81,7 +88,8 @@ const HELP_TEXT = `Commands:
   /notes       refresh notes-*.md from full transcript
   /interval N  set auto-nudge interval (seconds, min 10)
   /auto on|off  toggle auto-nudge
-  /gemini …    (wip) ask Gemini-in-Meet
+  /gemini      report Gemini-in-Meet drawer status
+  /gemini <q>  ask Gemini-in-Meet (drawer must be open)
   /help        this list
   /quit or "session over"   end and dump final-*.json
 
@@ -89,6 +97,54 @@ Free text → chat with Claude (with recent transcript context).
 
 Hotkeys (when the overlay is focused and input is empty):
   n=nudge  o=notes  t=type  ?=help  Esc=blur`;
+
+// First visible match wins. Update if Gemini drawer markup drifts.
+const GEMINI_SELECTORS = {
+  drawers: [
+    '[aria-label*="Gemini" i][role="region"]',
+    '[aria-label*="Take notes with Gemini" i]',
+    '[aria-label*="Companion" i]',
+    '[data-panel-id*="gemini" i]',
+    'div[aria-label*="Gemini" i]',
+    '[role="complementary"]',
+  ],
+  inputs: [
+    'textarea[aria-label*="Ask" i]',
+    'textarea[aria-label*="Gemini" i]',
+    'textarea[placeholder*="Ask" i]',
+    'div[contenteditable="true"][role="textbox"]',
+    'div[contenteditable="true"]',
+    'textarea',
+  ],
+  submits: [
+    'button[aria-label*="Send" i]',
+    'button[aria-label*="Submit" i]',
+    'button[type="submit"]',
+  ],
+};
+
+const queryGeminiTool = tool(
+  'query_gemini',
+  'Ask Gemini-in-Meet a question via the Workspace side drawer. Gemini has the full Meet context (its own transcript, participants, chat, metadata), which is richer than the partial caption window you have. Use only when the transcript is not enough; calls take 5-15 seconds. Returns Gemini\'s text response, or an error if the drawer is closed.',
+  { question: z.string().describe('The question to ask Gemini. Be specific — Gemini has the full meeting, so leverage that.') },
+  async ({ question }) => {
+    const status = await checkGeminiDrawer();
+    if (!status.open) {
+      return { content: [{ type: 'text', text: 'Gemini drawer is not open. Tell the user once to open the sparkles icon in Meet (top-right toolbar), then proceed with what you have.' }] };
+    }
+    const result = await driveGemini(question);
+    if (!result.ok) {
+      return { content: [{ type: 'text', text: 'Gemini error: ' + result.error }] };
+    }
+    return { content: [{ type: 'text', text: result.response }] };
+  }
+);
+
+const observerMcp = createSdkMcpServer({
+  name: 'observer',
+  version: '0.1.0',
+  tools: [queryGeminiTool],
+});
 
 const browser = await puppeteer.launch({
   headless: false,
@@ -197,10 +253,7 @@ async function dispatchCommand(cmd, arg) {
 
     case 'gemini':
     case 'g':
-      return appendMessage({
-        role: 'system',
-        text: `Gemini-in-Meet integration is WIP — coming next round. (You typed: "${arg}")`,
-      });
+      return runGemini(arg);
 
     case 'interval': {
       const n = parseInt(arg, 10);
@@ -248,7 +301,33 @@ async function askClaude(userText) {
   try {
     const recent = transcript.slice(-30).map(e => `${e.speaker}: ${e.text}`).join('\n');
     const prompt = `Recent transcript window:\n---\n${recent || '(no captions yet)'}\n---\n\nFacilitator: ${userText}`;
-    const raw = await callClaude({ system: CHAT_PROMPT, prompt });
+
+    const result = query({
+      prompt,
+      options: {
+        systemPrompt: CHAT_PROMPT,
+        model: MODEL_ID,
+        maxTurns: 4,
+        tools: [],
+        mcpServers: { observer: observerMcp },
+        allowedTools: ['mcp__observer__query_gemini'],
+        effort: 'low',
+      },
+    });
+
+    let raw = '';
+    for await (const msg of result) {
+      if (msg.type !== 'assistant') continue;
+      for (const block of msg.message.content) {
+        if (block.type === 'text') {
+          raw += block.text;
+        } else if (block.type === 'tool_use' && block.name?.includes('query_gemini')) {
+          const q = block.input?.question || '(no question captured)';
+          await appendMessage({ role: 'system', text: `claude → gemini: ${q}` });
+          await setStatus('claude is asking gemini…');
+        }
+      }
+    }
     await appendMessage({ role: 'assistant', text: raw.trim() || '(empty response)' });
   } catch (err) {
     await appendMessage({ role: 'error', text: `chat error: ${err.message}` });
@@ -320,6 +399,158 @@ async function runNotes() {
     busy = false;
     await setStatus('idle');
   }
+}
+
+async function runGemini(arg) {
+  const question = (arg || '').trim();
+
+  if (!question) {
+    const status = await checkGeminiDrawer();
+    if (!status.open) {
+      return appendMessage({
+        role: 'system',
+        text: 'Gemini drawer not detected. Open it in Meet (sparkles icon, top-right toolbar) and try /gemini again, or /gemini <question> to ask.',
+      });
+    }
+    return appendMessage({
+      role: 'system',
+      text: `Gemini drawer detected.\n  drawer selector: ${status.drawerSelector}\n  input selector: ${status.inputSelector || '(not found)'}\nReady. Use: /gemini <question>`,
+    });
+  }
+
+  if (busy) {
+    return appendMessage({ role: 'system', text: 'Working on something — try again in a moment.' });
+  }
+  busy = true;
+  await setStatus('asking gemini…');
+  try {
+    const status = await checkGeminiDrawer();
+    if (!status.open) {
+      await appendMessage({
+        role: 'system',
+        text: 'Gemini drawer is not open. Click the sparkles icon in Meet (top-right toolbar) to open it, then retry.',
+      });
+      return;
+    }
+    if (!status.hasInput) {
+      await appendMessage({
+        role: 'error',
+        text: `Gemini drawer is open (${status.drawerSelector}) but no input field matched. Selectors may have drifted — DevTools the input and update GEMINI_SELECTORS.inputs.`,
+      });
+      return;
+    }
+    const result = await driveGemini(question);
+    if (!result.ok) {
+      await appendMessage({ role: 'error', text: `Gemini drive failed: ${result.error}` });
+      return;
+    }
+    await appendMessage({ role: 'gemini', question, text: result.response });
+  } catch (err) {
+    await appendMessage({ role: 'error', text: `gemini error: ${err.message}` });
+  } finally {
+    busy = false;
+    await setStatus('idle');
+  }
+}
+
+async function checkGeminiDrawer() {
+  return await page.evaluate((sel) => {
+    const isVisible = (el) => !!(el && el.offsetWidth > 0 && el.offsetHeight > 0);
+    let drawer = null;
+    let drawerSelector = null;
+    for (const s of sel.drawers) {
+      const candidates = Array.from(document.querySelectorAll(s));
+      const v = candidates.find(isVisible);
+      if (v) { drawer = v; drawerSelector = s; break; }
+    }
+    if (!drawer) return { open: false };
+    let input = null;
+    let inputSelector = null;
+    for (const s of sel.inputs) {
+      const el = drawer.querySelector(s);
+      if (isVisible(el)) { input = el; inputSelector = s; break; }
+    }
+    return {
+      open: true,
+      drawerSelector,
+      inputSelector,
+      hasInput: !!input,
+    };
+  }, GEMINI_SELECTORS);
+}
+
+async function driveGemini(question) {
+  return await page.evaluate(async (q, sel) => {
+    const isVisible = (el) => !!(el && el.offsetWidth > 0 && el.offsetHeight > 0);
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    let drawer = null;
+    for (const s of sel.drawers) {
+      const v = Array.from(document.querySelectorAll(s)).find(isVisible);
+      if (v) { drawer = v; break; }
+    }
+    if (!drawer) return { ok: false, error: 'drawer not found / not visible' };
+
+    let input = null;
+    for (const s of sel.inputs) {
+      const el = drawer.querySelector(s);
+      if (isVisible(el)) { input = el; break; }
+    }
+    if (!input) return { ok: false, error: 'input not found in drawer' };
+
+    const snapBefore = drawer.innerText.length;
+
+    if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
+      const proto = window.HTMLTextAreaElement.prototype === Object.getPrototypeOf(input)
+        ? window.HTMLTextAreaElement.prototype
+        : window.HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (setter) setter.call(input, q); else input.value = q;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    } else if (input.isContentEditable) {
+      input.focus();
+      document.execCommand('selectAll', false, null);
+      document.execCommand('insertText', false, q);
+    } else {
+      return { ok: false, error: 'unsupported input type: ' + input.tagName };
+    }
+    input.focus();
+
+    let submit = null;
+    for (const s of sel.submits) {
+      const el = drawer.querySelector(s);
+      if (isVisible(el) && !el.disabled) { submit = el; break; }
+    }
+    if (submit) {
+      submit.click();
+    } else {
+      const enterEvent = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true });
+      input.dispatchEvent(enterEvent);
+    }
+
+    const start = Date.now();
+    const TIMEOUT_MS = 45000;
+    const STABLE_MS = 1800;
+    let lastLen = drawer.innerText.length;
+    let lastChange = Date.now();
+    while (Date.now() - start < TIMEOUT_MS) {
+      await sleep(400);
+      const cur = drawer.innerText.length;
+      if (cur !== lastLen) {
+        lastLen = cur;
+        lastChange = Date.now();
+        continue;
+      }
+      if (cur > snapBefore && Date.now() - lastChange > STABLE_MS) break;
+    }
+
+    const fullText = drawer.innerText;
+    const newPart = fullText.slice(snapBefore).trim();
+    if (!newPart) {
+      return { ok: false, error: 'no new text appeared in drawer within timeout' };
+    }
+    return { ok: true, response: newPart };
+  }, question, GEMINI_SELECTORS);
 }
 
 async function callClaude({ system, prompt }) {
@@ -417,10 +648,12 @@ async function injectOverlay() {
         const isNudge = role === 'nudge';
         const isSys = role === 'system';
         const isErr = role === 'error';
+        const isGemini = role === 'gemini';
 
         const nudgeColor = msg.urgency === 'now' ? '#f97316' : '#9ca3af';
         const bg = isUser ? 'rgba(96,165,250,0.12)'
           : isNudge ? 'rgba(249,115,22,0.08)'
+          : isGemini ? 'rgba(168,85,247,0.10)'
           : isErr ? 'rgba(252,165,165,0.10)'
           : isSys ? 'transparent'
           : 'rgba(255,255,255,0.04)';
@@ -434,6 +667,7 @@ async function injectOverlay() {
           `background:${bg}`,
           `color:${fg}`,
           isNudge ? `border-left:3px solid ${nudgeColor}` : '',
+          isGemini ? 'border-left:3px solid #a855f7' : '',
           isSys ? 'font-style:italic' : '',
           `font-size:${isSys || isErr ? '12px' : '13px'}`,
           'white-space:pre-wrap',
@@ -448,6 +682,20 @@ async function injectOverlay() {
             '💡 ' + (msg.urgency || '').toUpperCase());
           const body = make('div', '', msg.text);
           bubble.appendChild(tag);
+          bubble.appendChild(body);
+        } else if (isGemini) {
+          const tag = make('div',
+            'font-size:10px;color:#a855f7;font-weight:600;letter-spacing:0.06em;margin-bottom:4px;',
+            '✨ GEMINI');
+          if (msg.question) {
+            const q = make('div', 'font-size:11px;color:#d1d5db;margin-bottom:6px;font-style:italic;',
+              `Q: ${msg.question}`);
+            bubble.appendChild(tag);
+            bubble.appendChild(q);
+          } else {
+            bubble.appendChild(tag);
+          }
+          const body = make('div', '', msg.text);
           bubble.appendChild(body);
         } else if (isSys || isErr) {
           bubble.textContent = msg.text;

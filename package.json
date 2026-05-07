@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.132",
-    "puppeteer": "^24.43.0"
+    "puppeteer": "^24.43.0",
+    "zod": "^4.4.3"
   }
 }

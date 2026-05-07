@@ -59,7 +59,8 @@ ways to use it:
 /notes        refresh notes-*.md from full transcript
 /interval N   set auto-nudge interval (seconds, min 10)
 /auto on|off  toggle auto-nudge
-/gemini …     (wip) ask Gemini-in-Meet — coming next round
+/gemini       report Gemini-in-Meet drawer status
+/gemini <q>   ask Gemini-in-Meet (drawer must be open)
 /help         this list
 /quit         end and dump final-*.json
 ```
@@ -130,7 +131,34 @@ browser or app may not be secure"). If that happens:
    ```
 5. `npm start`.
 
-## What's still WIP
+## Gemini-in-Meet integration
 
-- `/gemini` — the plan is to drive the Gemini-in-Meet side panel via
-  Puppeteer so Claude can autonomously query it as a tool. Not wired yet.
+Open the Gemini drawer in Meet (sparkles icon, top-right toolbar). With it
+open, two things become possible:
+
+**Manual passthrough** via the `/gemini` command:
+- `/gemini` (no args) — reports drawer status. If detected, prints the
+  matched selectors. Useful for confirming the integration sees what you
+  see before you ask a real question.
+- `/gemini <question>` — types your question into the drawer's input,
+  submits, polls until Gemini stops streaming, and posts the response
+  back as a purple "✨ GEMINI" bubble in the panel feed.
+
+**Autonomous tool use by Claude.** Claude is given `query_gemini` as a
+tool via the Agent SDK's MCP support. When you free-chat with Claude
+and the partial caption window doesn't have what Claude needs to answer
+well, Claude can decide on its own to ask Gemini — Gemini has the full
+Meet context (its own transcript, all participants, chat, metadata).
+When that happens, you'll see a `claude → gemini: <question>` system
+line in the feed, then Claude's final answer (which integrates Gemini's
+response). Claude is instructed not to use the tool unnecessarily —
+calls take 5–15 seconds.
+
+Selectors are best-guesses against an undocumented Workspace UI. If the
+drawer markup drifts, edit `GEMINI_SELECTORS` near the top of
+`observer.js` to add new candidates. Order matters — first visible match
+wins.
+
+If `/gemini` says drawer not detected even though it's clearly open, open
+DevTools in the Puppeteer Chromium, inspect the drawer container, and
+extend `GEMINI_SELECTORS.drawers`.
