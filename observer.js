@@ -357,9 +357,19 @@ async function injectOverlay() {
       root.id = 'claude-observer-overlay';
       root.tabIndex = 0;
 
+      // Restore saved position if present
+      try {
+        const saved = JSON.parse(localStorage.getItem('claude-observer-pos') || 'null');
+        if (saved && typeof saved.left === 'string' && typeof saved.top === 'string') {
+          root.style.left = saved.left;
+          root.style.top = saved.top;
+          root.style.right = 'auto';
+        }
+      } catch (e) { /* ignore */ }
+
       const header = make('div',
-        'display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid rgba(255,255,255,0.08);');
-      const title = make('span', 'font-weight:600;letter-spacing:0.02em;', 'Claude Observer');
+        'display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid rgba(255,255,255,0.08);cursor:move;user-select:none;');
+      const title = make('span', 'font-weight:600;letter-spacing:0.02em;pointer-events:none;', 'Claude Observer');
       const statusEl = make('span', 'font-size:11px;color:#9ca3af;', 'starting…');
       statusEl.id = 'co-status';
       header.appendChild(title);
@@ -442,21 +452,38 @@ async function injectOverlay() {
 
       window.__observerStatus = (s) => { statusEl.textContent = s; };
 
-      form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const text = input.value;
-        if (!text.trim()) return;
-        input.value = '';
-        try { await window.observerSubmit(text); }
-        catch (err) { console.error('observerSubmit:', err); }
-      });
+      const submitText = (text) => {
+        if (!text || !text.trim()) return;
+        if (typeof window.observerSubmit !== 'function') {
+          console.error('[observer] observerSubmit not bound on window');
+          statusEl.textContent = 'binding error — see console';
+          return;
+        }
+        Promise.resolve(window.observerSubmit(text)).catch((err) => {
+          console.error('[observer] submit error:', err);
+        });
+      };
+
+      // Direct Enter handler with capture+stopPropagation so Meet can't steal it.
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+          e.preventDefault();
+          e.stopPropagation();
+          const text = input.value;
+          input.value = '';
+          submitText(text);
+        }
+      }, true);
+
+      // Block native form submission (Enter on input would otherwise reload).
+      form.addEventListener('submit', (e) => { e.preventDefault(); });
 
       root.addEventListener('keydown', (e) => {
         const inputFocused = document.activeElement === input;
         if (!inputFocused) {
-          if (e.key === 'n') { e.preventDefault(); e.stopPropagation(); window.observerSubmit('/nudge'); return; }
-          if (e.key === 'o') { e.preventDefault(); e.stopPropagation(); window.observerSubmit('/notes'); return; }
-          if (e.key === '?') { e.preventDefault(); e.stopPropagation(); window.observerSubmit('/help'); return; }
+          if (e.key === 'n') { e.preventDefault(); e.stopPropagation(); submitText('/nudge'); return; }
+          if (e.key === 'o') { e.preventDefault(); e.stopPropagation(); submitText('/notes'); return; }
+          if (e.key === '?') { e.preventDefault(); e.stopPropagation(); submitText('/help'); return; }
           if (e.key === 't') { e.preventDefault(); e.stopPropagation(); input.focus(); return; }
         }
         if (e.key === 'Escape') {
@@ -465,6 +492,38 @@ async function injectOverlay() {
           else { root.blur(); }
         }
       }, true);
+
+      // Drag from header
+      let dragging = false;
+      let dragStart = null;
+      header.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        const rect = root.getBoundingClientRect();
+        dragging = true;
+        dragStart = { mx: e.clientX, my: e.clientY, rx: rect.left, ry: rect.top };
+        e.preventDefault();
+      });
+      const onMove = (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - dragStart.mx;
+        const dy = e.clientY - dragStart.my;
+        const left = Math.max(0, Math.min(window.innerWidth - 80, dragStart.rx + dx));
+        const top = Math.max(0, Math.min(window.innerHeight - 60, dragStart.ry + dy));
+        root.style.left = left + 'px';
+        root.style.top = top + 'px';
+        root.style.right = 'auto';
+      };
+      const onUp = () => {
+        if (!dragging) return;
+        dragging = false;
+        try {
+          localStorage.setItem('claude-observer-pos', JSON.stringify({
+            left: root.style.left, top: root.style.top,
+          }));
+        } catch (e) { /* ignore */ }
+      };
+      document.addEventListener('mousemove', onMove, true);
+      document.addEventListener('mouseup', onUp, true);
 
       return { attached: true };
     });
