@@ -5,10 +5,12 @@ import fs from 'fs';
 const TRANSCRIPT_FILE = `transcript-${Date.now()}.jsonl`;
 const NUDGE_INTERVAL_MS = 2 * 60 * 1000;
 const MODEL_ID = 'opus';
+const DEBUG_OVERLAY = false;
 
 const seen = new Set();
 const transcript = [];
 let lastNudgeIndex = 0;
+let overlayAttachCount = 0;
 
 const SYSTEM_PROMPT = `You are an observer for a creative-team workflow tutoring session.
 
@@ -72,29 +74,41 @@ async function startScraping() {
     } catch (err) {
       console.error('scrape error:', err.message);
     }
+    await injectOverlay();
   }, 3000);
 
-  await injectOverlay();
   setInterval(nudgeTurn, NUDGE_INTERVAL_MS);
-  console.log(`🟣 Nudge loop active. Asking ${MODEL_ID} every ${NUDGE_INTERVAL_MS / 1000}s.`);
+  console.log(`🟣 Nudge loop active. Asking ${MODEL_ID} every ${NUDGE_INTERVAL_MS / 1000}s.${DEBUG_OVERLAY ? ' [DEBUG_OVERLAY=true]' : ''}`);
 }
 
 async function injectOverlay() {
   try {
-    await page.evaluate(() => {
-      if (document.getElementById('claude-observer-overlay')) return;
+    const result = await page.evaluate((debug) => {
+      if (document.getElementById('claude-observer-overlay')) {
+        return { attached: false };
+      }
       const div = document.createElement('div');
       div.id = 'claude-observer-overlay';
       div.style.cssText = `
-        position: fixed; top: 20px; right: 20px; z-index: 999999;
+        position: fixed; top: 20px; right: 20px; z-index: 2147483647;
         width: 280px; padding: 12px 14px;
         background: rgba(20,20,20,0.85); backdrop-filter: blur(8px);
         color: white; font: 13px/1.4 system-ui, -apple-system, sans-serif;
         border-radius: 8px; border-left: 3px solid #6b7280;
-        pointer-events: none; opacity: 0; transition: opacity 0.3s;
+        pointer-events: none; transition: opacity 0.3s;
+        opacity: ${debug ? '1' : '0'};
       `;
+      if (debug) div.textContent = 'observer active — waiting for first nudge';
       document.body.appendChild(div);
-    });
+      return { attached: true };
+    }, DEBUG_OVERLAY);
+
+    if (result?.attached) {
+      overlayAttachCount += 1;
+      if (overlayAttachCount === 1 || overlayAttachCount % 5 === 0) {
+        console.log(`🪟 overlay attached (count=${overlayAttachCount})`);
+      }
+    }
   } catch (err) {
     console.error('overlay inject error:', err.message);
   }
