@@ -87,10 +87,11 @@ exits 0.
 ## Files written at runtime
 
 - `transcript-<ts>.jsonl` — append-only, one JSON line per deduped caption.
-- `notes-<ts>.md` — refreshed by `/notes`. Same file is rewritten each call.
+- `notes-<ts>.md` — refreshed by `/notes`. Same file is rewritten each call. `/notes` is incremental: only new captions since the last refresh are sent to Claude, plus the prior notes doc, so the prompt stays bounded as the meeting grows.
 - `final-<ts>.json` — written on `session over` / `/quit`.
+- `.observer-session` — last chat session ID. Persists chat continuity across script restarts; loaded automatically on next `npm start`. Run `/clear` to wipe.
 
-All three are gitignored.
+All four are gitignored.
 
 ## Configuration
 

@@ -5,6 +5,8 @@ import fs from 'fs';
 
 const TRANSCRIPT_FILE = `transcript-${Date.now()}.jsonl`;
 const NOTES_FILE = `notes-${Date.now()}.md`;
+const SESSION_FILE = '.observer-session';
+const NOTES_CHUNK_CAP = 300;
 const MODEL_ID = 'opus';
 const STATUS_INTERVAL_MS = 30 * 1000;
 const SCRAPE_INTERVAL_MS = 3000;
@@ -14,6 +16,7 @@ const seen = new Set();
 const transcript = [];
 
 let lastNudgeIndex = 0;
+let lastNotesIndex = 0;
 let lastStatusCount = 0;
 let overlayAttachCount = 0;
 let nudgeIntervalMs = DEFAULT_NUDGE_INTERVAL_MS;
@@ -22,6 +25,12 @@ let nudgeTimer = null;
 let busy = false;
 let welcomeShown = false;
 let chatSessionId = null;
+try {
+  if (fs.existsSync(SESSION_FILE)) {
+    const saved = fs.readFileSync(SESSION_FILE, 'utf8').trim();
+    if (saved) chatSessionId = saved;
+  }
+} catch (e) { /* ignore */ }
 
 const NUDGE_PROMPT = `You are an observer for a creative-team workflow tutoring session.
 
@@ -162,6 +171,9 @@ await page.exposeFunction('observerSubmit', handleSubmit);
 
 await page.goto('https://meet.google.com/');
 
+if (chatSessionId) {
+  console.log(`💬 Resuming prior chat session ${chatSessionId.slice(0, 8)}… (run /clear in the panel to wipe).`);
+}
 console.log('🟢 Log into Google and join the Meet. Press Enter here when captions are ON.');
 process.stdin.once('data', () => startScraping());
 
@@ -287,6 +299,7 @@ async function dispatchCommand(cmd, arg) {
 
     case 'clear':
       chatSessionId = null;
+      try { fs.unlinkSync(SESSION_FILE); } catch (e) { /* file may not exist */ }
       return appendMessage({ role: 'system', text: 'Chat memory cleared. Next message starts a fresh conversation. Transcript and notes are untouched.' });
 
     case 'quit':
@@ -356,7 +369,10 @@ async function runChatTurn(prompt) {
       }
     }
   }
-  if (lastSessionId) chatSessionId = lastSessionId;
+  if (lastSessionId) {
+    chatSessionId = lastSessionId;
+    try { fs.writeFileSync(SESSION_FILE, lastSessionId); } catch (e) { /* non-fatal */ }
+  }
   return raw;
 }
 
@@ -404,9 +420,24 @@ async function runNotes() {
   busy = true;
   await setStatus('writing notes…');
   try {
-    const fullTranscript = transcript.map(e => `${e.speaker}: ${e.text}`).join('\n');
-    const previous = fs.existsSync(NOTES_FILE) ? fs.readFileSync(NOTES_FILE, 'utf8') : '(no previous notes)';
-    const prompt = `Previous notes:\n---\n${previous}\n---\n\nFull transcript so far:\n---\n${fullTranscript || '(no transcript yet)'}\n---\n\nWrite a fresh markdown notes doc per the system instructions.`;
+    const newSlice = transcript.slice(lastNotesIndex);
+    if (newSlice.length === 0 && fs.existsSync(NOTES_FILE)) {
+      await appendMessage({ role: 'system', text: 'No new captions since last notes refresh.' });
+      return;
+    }
+    const truncated = newSlice.length > NOTES_CHUNK_CAP;
+    const sending = truncated ? newSlice.slice(-NOTES_CHUNK_CAP) : newSlice;
+    const truncNote = truncated
+      ? `\n(NOTE: ${newSlice.length - NOTES_CHUNK_CAP} older lines from this chunk were trimmed for length; integrate from the latest ${NOTES_CHUNK_CAP} below.)`
+      : '';
+    const newText = sending.length
+      ? sending.map(e => `${e.speaker}: ${e.text}`).join('\n')
+      : '(no new captions)';
+    const previous = fs.existsSync(NOTES_FILE)
+      ? fs.readFileSync(NOTES_FILE, 'utf8')
+      : '(no previous notes — this is the first synthesis)';
+
+    const prompt = `Previous notes (your running synthesis so far):\n---\n${previous}\n---\n\nNew transcript since last refresh${truncNote}:\n---\n${newText}\n---\n\nUpdate the notes by integrating the new section. Preserve and refine the prior sections; do not drop earlier insight. Output the COMPLETE updated markdown doc, not a diff.`;
     const raw = await callClaude({ system: NOTES_PROMPT, prompt });
     const md = stripFences(raw).trim();
     if (!md) {
@@ -414,8 +445,10 @@ async function runNotes() {
       return;
     }
     fs.writeFileSync(NOTES_FILE, md);
+    lastNotesIndex = transcript.length;
     const wc = md.split(/\s+/).filter(Boolean).length;
-    await appendMessage({ role: 'system', text: `Notes refreshed → ${NOTES_FILE} (${wc} words).` });
+    const trim = truncated ? ` (chunk trimmed: ${newSlice.length} → ${NOTES_CHUNK_CAP})` : '';
+    await appendMessage({ role: 'system', text: `Notes refreshed → ${NOTES_FILE} (${wc} words${trim}).` });
   } catch (err) {
     await appendMessage({ role: 'error', text: `notes error: ${err.message}` });
   } finally {
@@ -855,7 +888,10 @@ async function injectOverlay() {
       }
       if (!welcomeShown) {
         welcomeShown = true;
-        await appendMessage({ role: 'system', text: 'Observer ready. Type a message, hit ? for help, or use hotkeys (n/o/t).' });
+        const resumeNote = chatSessionId
+          ? ` Resuming prior chat session (${chatSessionId.slice(0, 8)}…) — run /clear to wipe.`
+          : '';
+        await appendMessage({ role: 'system', text: `Observer ready. Type a message, hit ? for help, or use hotkeys (n/o/t).${resumeNote}` });
         await setStatus('idle');
       }
     }
