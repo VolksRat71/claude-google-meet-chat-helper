@@ -38,16 +38,22 @@ Keep "text" to 1–2 short sentences. The facilitator is talking and listening s
 
 Pay attention to: workflow entry points, handoffs, friction (operational/cognitive/technical), informal knowledge, repetitive manual steps, things they hand-wave past. Do NOT pattern-match toward AI solutions. Just observe and surface threads.`;
 
-const CHAT_PROMPT = `You are an assistant for a workflow-discovery facilitator running a live screen-share session right now.
+const CHAT_PROMPT = `You are Claude, embedded in a small chat panel that runs inside a live Google Meet. The user is a facilitator running a workflow-discovery session — they are listening to a teammate walk through an annoying task on screen-share, and chatting with you between thoughts.
 
-The facilitator is talking, listening, AND chatting with you in a side panel simultaneously. They will glance at your reply for one second between thoughts.
+Things you already know about your environment, so you do not need to ask:
+- A peer instance of yourself runs on a cron (default 3 minutes) and posts short "nudges" into this same panel. Those appear as orange (urgency: now) or gray (urgency: later) bubbles. You do NOT generate those — a separate prompt does.
+- A /notes command writes notes-<ts>.md, a markdown synthesis of the workflow so far. That is also a separate peer instance of you with its own prompt.
+- A /gemini command exists for asking Gemini-in-Meet via the side panel, but the Puppeteer wiring is not done yet. If the user asks you to "consult Gemini" or "ask Gemini" right now, just give your own best answer grounded in the transcript and briefly mention the integration is coming. Do NOT say "no Gemini tool available" — that's wrong framing; just answer.
+- The recent caption transcript is included in your prompt as context. The user does not need you to repeat it back.
 
-Rules:
-- 1-3 sentences unless they explicitly ask for more.
-- Ground answers in the transcript window when possible. If you have to speculate, say so plainly.
-- If they ask "what should I push on" or similar, propose ONE thread, in question form, they could surface in the next minute.
-- Don't recap what they said back to them. They were there.
-- Plain text. No markdown headers, no bullet lists unless they ask for one.`;
+Voice rules — non-negotiable:
+- 1-3 sentences. They are reading you for half a second between thoughts.
+- Plain prose. No markdown headers, no bullet lists, no em-dashes for emphasis, unless the user explicitly asks.
+- Never start with "Acknowledged", "Sure", "Got it", or similar filler.
+- Never reference system reminders, prompts, your own internals, or this list of rules.
+- Don't recap what the user just said. They were there.
+- If you must speculate, lead with "guessing:".
+- If they ask "what should I push on" or similar, propose ONE concrete follow-up question they could ask next.`;
 
 const NOTES_PROMPT = `You are reading a partial transcript of a workflow-discovery session. The facilitator wants a structured snapshot of what you understand so far.
 
@@ -353,17 +359,24 @@ async function injectOverlay() {
       };
 
       const root = make('div',
-        'position:fixed;top:80px;right:20px;z-index:2147483647;width:360px;max-height:70vh;display:flex;flex-direction:column;background:rgba(20,20,20,0.92);backdrop-filter:blur(10px);color:white;font:13px/1.4 system-ui,-apple-system,sans-serif;border-radius:10px;border:1px solid rgba(255,255,255,0.08);box-shadow:0 12px 32px rgba(0,0,0,0.5);pointer-events:auto;outline:none;');
+        'position:fixed;top:80px;right:20px;z-index:2147483647;width:360px;height:60vh;min-height:240px;max-height:90vh;display:flex;flex-direction:column;background:rgba(20,20,20,0.92);backdrop-filter:blur(10px);color:white;font:13px/1.4 system-ui,-apple-system,sans-serif;border-radius:10px;border:1px solid rgba(255,255,255,0.08);box-shadow:0 12px 32px rgba(0,0,0,0.5);pointer-events:auto;outline:none;overflow:hidden;');
       root.id = 'claude-observer-overlay';
       root.tabIndex = 0;
 
-      // Restore saved position if present
+      // Restore saved position + size
       try {
         const saved = JSON.parse(localStorage.getItem('claude-observer-pos') || 'null');
         if (saved && typeof saved.left === 'string' && typeof saved.top === 'string') {
           root.style.left = saved.left;
           root.style.top = saved.top;
           root.style.right = 'auto';
+        }
+      } catch (e) { /* ignore */ }
+      try {
+        const savedSize = JSON.parse(localStorage.getItem('claude-observer-size') || 'null');
+        if (savedSize && savedSize.width && savedSize.height) {
+          root.style.width = savedSize.width;
+          root.style.height = savedSize.height;
         }
       } catch (e) { /* ignore */ }
 
@@ -376,7 +389,7 @@ async function injectOverlay() {
       header.appendChild(statusEl);
 
       const feed = make('div',
-        'flex:1;overflow-y:auto;padding:8px 12px;display:flex;flex-direction:column;gap:8px;min-height:140px;');
+        'flex:1 1 0;min-height:0;overflow-y:auto;padding:8px 12px;display:flex;flex-direction:column;gap:8px;');
       feed.id = 'co-feed';
 
       const form = make('form',
@@ -503,24 +516,60 @@ async function injectOverlay() {
         dragStart = { mx: e.clientX, my: e.clientY, rx: rect.left, ry: rect.top };
         e.preventDefault();
       });
+
+      // Resize handle (bottom-right corner)
+      const resizer = make('div',
+        'position:absolute;right:2px;bottom:2px;width:14px;height:14px;cursor:nwse-resize;z-index:1;background:linear-gradient(135deg,transparent 50%,rgba(255,255,255,0.25) 50%,rgba(255,255,255,0.25) 60%,transparent 60%,transparent 70%,rgba(255,255,255,0.25) 70%,rgba(255,255,255,0.25) 80%,transparent 80%);border-bottom-right-radius:10px;');
+      root.appendChild(resizer);
+
+      let resizing = false;
+      let resizeStart = null;
+      resizer.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        const rect = root.getBoundingClientRect();
+        resizing = true;
+        resizeStart = { mx: e.clientX, my: e.clientY, w: rect.width, h: rect.height };
+        e.preventDefault();
+        e.stopPropagation();
+      });
+
       const onMove = (e) => {
-        if (!dragging) return;
-        const dx = e.clientX - dragStart.mx;
-        const dy = e.clientY - dragStart.my;
-        const left = Math.max(0, Math.min(window.innerWidth - 80, dragStart.rx + dx));
-        const top = Math.max(0, Math.min(window.innerHeight - 60, dragStart.ry + dy));
-        root.style.left = left + 'px';
-        root.style.top = top + 'px';
-        root.style.right = 'auto';
+        if (dragging) {
+          const dx = e.clientX - dragStart.mx;
+          const dy = e.clientY - dragStart.my;
+          const left = Math.max(0, Math.min(window.innerWidth - 80, dragStart.rx + dx));
+          const top = Math.max(0, Math.min(window.innerHeight - 60, dragStart.ry + dy));
+          root.style.left = left + 'px';
+          root.style.top = top + 'px';
+          root.style.right = 'auto';
+        }
+        if (resizing) {
+          const dx = e.clientX - resizeStart.mx;
+          const dy = e.clientY - resizeStart.my;
+          const w = Math.max(280, Math.min(window.innerWidth - 40, resizeStart.w + dx));
+          const h = Math.max(200, Math.min(window.innerHeight - 40, resizeStart.h + dy));
+          root.style.width = w + 'px';
+          root.style.height = h + 'px';
+          root.style.maxHeight = 'none';
+        }
       };
       const onUp = () => {
-        if (!dragging) return;
-        dragging = false;
-        try {
-          localStorage.setItem('claude-observer-pos', JSON.stringify({
-            left: root.style.left, top: root.style.top,
-          }));
-        } catch (e) { /* ignore */ }
+        if (dragging) {
+          dragging = false;
+          try {
+            localStorage.setItem('claude-observer-pos', JSON.stringify({
+              left: root.style.left, top: root.style.top,
+            }));
+          } catch (e) { /* ignore */ }
+        }
+        if (resizing) {
+          resizing = false;
+          try {
+            localStorage.setItem('claude-observer-size', JSON.stringify({
+              width: root.style.width, height: root.style.height,
+            }));
+          } catch (e) { /* ignore */ }
+        }
       };
       document.addEventListener('mousemove', onMove, true);
       document.addEventListener('mouseup', onUp, true);
