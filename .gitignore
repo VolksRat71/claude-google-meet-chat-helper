@@ -1,0 +1,7 @@
+node_modules/
+transcript-*.jsonl
+final-*.json
+notes-*.md
+.observer-session
+.env
+.DS_Store
