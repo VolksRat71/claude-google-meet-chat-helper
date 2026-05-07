@@ -1,8 +1,9 @@
 # claude-google-meet-chat-helper
 
 A standalone Node script that observes a live Google Meet, scrapes captions,
-and asks Claude every 2 minutes whether there's a thread the facilitator
-should pull on. If yes, a small nudge appears in the corner of the Meet tab.
+and runs a small chat panel inside the Meet page so you can talk to Claude
+while you facilitate. Claude can also nudge you on its own — the auto-nudge
+loop watches the transcript and surfaces threads worth pulling on.
 
 Built for facilitating workflow-discovery sessions where a teammate walks
 through an annoying task and you're trying to spot the friction worth
@@ -14,13 +15,12 @@ Requires Node 20+ and a logged-in Claude Code CLI (`claude`).
 
 ```sh
 npm install
-# confirm `claude` is on PATH and authenticated
-claude --version
+claude --version  # confirm it's on PATH and authenticated
 ```
 
 This branch uses `@anthropic-ai/claude-agent-sdk`, which shells out to your
-local `claude` CLI for inference. Auth comes from your Claude
-Pro/Max subscription — no `ANTHROPIC_API_KEY` needed.
+local `claude` CLI for inference. Auth comes from your Claude Pro/Max
+subscription — no `ANTHROPIC_API_KEY` needed.
 
 If you'd rather pay per-token via the Anthropic API, switch to the
 `feat/observer` branch which uses `@anthropic-ai/sdk` directly.
@@ -31,68 +31,83 @@ If you'd rather pay per-token via the Anthropic API, switch to the
 npm start
 ```
 
-A Chromium window opens at `meet.google.com`. Steps:
+1. Chromium opens at `meet.google.com`.
+2. Log into Google in that Chromium.
+3. Join your Meet.
+4. Turn captions on (CC button, bottom toolbar).
+5. Switch back to your terminal and press **Enter**.
 
-1. Log into Google in that Chromium.
-2. Join your Meet.
-3. Turn captions on (CC button, bottom toolbar).
-4. Switch back to your terminal and press **Enter**.
+A "Claude Observer" panel appears in the top-right of the Meet page. From
+there everything happens in the panel — the terminal goes mostly silent.
 
-You should now see caption lines streaming to the terminal:
+## Using the panel
+
+The panel has a scrolling feed and an input field at the bottom. Three
+ways to use it:
+
+- **Free chat** — type anything, hit Enter. Claude answers with the recent
+  transcript window as context.
+- **Slash commands** — see `/help` (below).
+- **Hotkeys** — when the panel is focused (click on it) and the input is
+  empty: `n` runs `/nudge`, `o` runs `/notes`, `t` jumps to the input,
+  `?` shows help, `Esc` blurs back to Meet.
+
+### Commands
 
 ```
-[Alice] so the way I usually start is by exporting from Looker
-[Bob] and then you paste it where
-[Alice] yeah into the master sheet
+/nudge        force a nudge from recent captions
+/notes        refresh notes-*.md from full transcript
+/interval N   set auto-nudge interval (seconds, min 10)
+/auto on|off  toggle auto-nudge
+/gemini …     (wip) ask Gemini-in-Meet — coming next round
+/help         this list
+/quit         end and dump final-*.json
 ```
 
-Captions are also appended to `transcript-<timestamp>.jsonl` in the cwd.
+`session over` typed in the panel input OR in the terminal also ends the
+session.
 
-After ~2 minutes Claude gets its first window of transcript and may emit a
-nudge. When it does:
+### Auto-nudge
 
-- Console: `💡 [now] What does "the master sheet" actually contain?`
-- Overlay: a small dark card appears top-right of the Meet page with the
-  same text. Border is orange for `now`, gray for `later`.
+Defaults to every 3 minutes. Adjust on the fly: `/interval 90` for 90s,
+`/auto off` to silence it, `/auto on` to bring it back. Auto-nudges only
+fire on transcript chunks that haven't already been sent — they don't
+double-up.
 
 ## Stop
 
-Type `session over` + Enter in the terminal. The script writes a
+Type `session over` (or `/quit`) in the panel. The script writes
 `final-<timestamp>.json` containing the full structured transcript and
-exits cleanly.
+exits 0.
 
-`Ctrl-C` also works — the JSONL transcript is already on disk from
-append-as-you-go, you just don't get the structured final dump.
+`Ctrl-C` also works as a floor — the JSONL transcript is already on disk.
+
+## Files written at runtime
+
+- `transcript-<ts>.jsonl` — append-only, one JSON line per deduped caption.
+- `notes-<ts>.md` — refreshed by `/notes`. Same file is rewritten each call.
+- `final-<ts>.json` — written on `session over` / `/quit`.
+
+All three are gitignored.
+
+## Configuration
+
+Top of `observer.js`:
+
+| Const | Default | What it does |
+|-------|---------|---|
+| `DEFAULT_NUDGE_INTERVAL_MS` | `3 * 60 * 1000` | Auto-nudge cadence at startup. Can be overridden live with `/interval`. |
+| `MODEL_ID` | `opus` | Claude Agent SDK model alias (`opus`, `sonnet`, `haiku`) or full id like `claude-opus-4-7`. |
 
 ## Selector hunt
 
-Meet's caption DOM changes. The selectors in `observer.js` are spec
-defaults and almost certainly need updating:
-
-```js
-const nodes = document.querySelectorAll('[jsname="tgaKEf"], .iOzk7, .TBMuR');
-const speaker = n.querySelector('.zs7s8d, .NWpY1d')?.textContent?.trim();
-const text = n.querySelector('.bh44bd, .ygicle')?.textContent?.trim();
-```
-
-If captions aren't streaming after you press Enter:
+Meet's caption DOM drifts. The selectors in `observer.js` worked as of the
+last live test, but if captions stop streaming after you press Enter:
 
 1. In the Puppeteer Chromium, right-click a caption row → **Inspect**.
 2. Note the container's `jsname=` or class.
 3. Replace the three selector strings in `observer.js`.
 4. Restart `npm start`.
-
-Budget 5 minutes. If selectors take longer than that, fall back to
-Gemini's official transcript at the end of your session.
-
-## Configuration
-
-In `observer.js` near the top:
-
-| Const | Default | What it does |
-|-------|---------|---|
-| `NUDGE_INTERVAL_MS` | `2 * 60 * 1000` | How often Claude is asked for a nudge. |
-| `MODEL_ID` | `opus` | Claude Agent SDK model alias (`opus`, `sonnet`, `haiku`) or full id like `claude-opus-4-7`. |
 
 ## Google login fallback
 
@@ -107,13 +122,7 @@ browser or app may not be secure"). If that happens:
      --user-data-dir=/tmp/chrome-meet-observer
    ```
 3. In that Chrome, log into Google and join the Meet.
-4. In `observer.js`, replace:
-   ```js
-   const browser = await puppeteer.launch({ headless: false, defaultViewport: null, args: ['--start-maximized'] });
-   const page = (await browser.pages())[0];
-   await page.goto('https://meet.google.com/');
-   ```
-   with:
+4. In `observer.js`, replace the `puppeteer.launch(...)` block with:
    ```js
    const browser = await puppeteer.connect({ browserURL: 'http://localhost:9222' });
    const pages = await browser.pages();
@@ -121,14 +130,7 @@ browser or app may not be secure"). If that happens:
    ```
 5. `npm start`.
 
-## Files in cwd at runtime
+## What's still WIP
 
-- `transcript-<timestamp>.jsonl` — append-only, one JSON line per deduped caption.
-- `final-<timestamp>.json` — written on `session over`, full structured dump.
-
-Both are gitignored.
-
-## What this is not
-
-No persistence between sessions, no post-session analysis, no Gemini gem
-construction, no UI beyond the overlay div. By design.
+- `/gemini` — the plan is to drive the Gemini-in-Meet side panel via
+  Puppeteer so Claude can autonomously query it as a tool. Not wired yet.

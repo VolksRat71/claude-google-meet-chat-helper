@@ -1,5 +1,6 @@
 node_modules/
 transcript-*.jsonl
 final-*.json
+notes-*.md
 .env
 .DS_Store
