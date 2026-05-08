@@ -309,12 +309,76 @@ async function startScraping() {
 async function scrapeOnce() {
   try {
     const lines = await page.evaluate(() => {
-      const nodes = document.querySelectorAll('[jsname="tgaKEf"], .iOzk7, .TBMuR');
-      return Array.from(nodes).map(n => {
-        const speaker = n.querySelector('.zs7s8d, .NWpY1d')?.textContent?.trim() || 'unknown';
-        const text = n.querySelector('.bh44bd, .ygicle')?.textContent?.trim() || n.textContent?.trim() || '';
-        return { speaker, text };
-      }).filter(x => x.text);
+      // Per-page state. WeakMap keyed by row node so we never double-emit the
+      // same caption row, and detect when a row's text grows (live captioning)
+      // versus when a NEW row appears for a different speaker.
+      window.__observerCaptionState = window.__observerCaptionState || new WeakMap();
+      const state = window.__observerCaptionState;
+
+      const SPEAKER_SEL = '.zs7s8d, .NWpY1d';
+      const TEXT_SEL = '.bh44bd, .ygicle';
+      const CONTAINER_SEL = '[jsname="tgaKEf"], .iOzk7, .TBMuR';
+
+      // Pair each speaker label with its associated text body. We key state
+      // by the SPEAKER element (not the row) so flat DOM layouts where
+      // multiple speakers share one container still track independently.
+      const rows = [];
+      const containers = document.querySelectorAll(CONTAINER_SEL);
+      for (const c of containers) {
+        const speakerEls = c.querySelectorAll(SPEAKER_SEL);
+        for (const sp of speakerEls) {
+          let textEl = null;
+          // 1. Search forward through siblings for the next text element.
+          let n = sp.nextElementSibling;
+          while (n && !textEl) {
+            if (n.matches?.(TEXT_SEL)) textEl = n;
+            else textEl = n.querySelector?.(TEXT_SEL) || null;
+            n = n.nextElementSibling;
+          }
+          // 2. Fall back to walking up to the first ancestor with a text body.
+          if (!textEl) {
+            let cur = sp.parentElement;
+            while (cur && cur !== document.body && !textEl) {
+              textEl = cur.querySelector(TEXT_SEL);
+              if (textEl && !cur.contains(sp)) textEl = null;
+              if (!textEl) cur = cur.parentElement;
+            }
+          }
+          if (textEl) rows.push({ speakerEl: sp, textEl });
+        }
+      }
+
+      const out = [];
+      for (const { speakerEl, textEl } of rows) {
+        const speaker = speakerEl.textContent?.trim() || 'unknown';
+        const text = textEl.textContent?.trim() || '';
+        if (!text || text === speaker) continue;
+
+        const prev = state.get(speakerEl);
+        if (!prev) {
+          state.set(speakerEl, { speaker, text });
+          out.push({ speaker, text });
+          continue;
+        }
+        if (prev.text === text && prev.speaker === speaker) continue;
+        if (prev.speaker !== speaker) {
+          // Speaker reattribution (e.g., "unknown" → real name) — emit as new.
+          state.set(speakerEl, { speaker, text });
+          out.push({ speaker, text });
+          continue;
+        }
+        if (text.startsWith(prev.text)) {
+          // Same row, text grew. Emit only the new tail.
+          const delta = text.slice(prev.text.length).trim();
+          state.set(speakerEl, { speaker, text });
+          if (delta) out.push({ speaker, text: delta });
+          continue;
+        }
+        // Some other change — emit as new.
+        state.set(row, { speaker, text });
+        out.push({ speaker, text });
+      }
+      return out;
     });
 
     for (const line of lines) {
