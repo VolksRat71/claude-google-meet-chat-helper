@@ -1,7 +1,9 @@
 node_modules/
 transcript-*.jsonl
+transcript-*.jsonl.state.json
 final-*.json
 notes-*.md
 .observer-session
+.observer-config.json
 .env
 .DS_Store
